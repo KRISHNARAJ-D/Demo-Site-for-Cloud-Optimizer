@@ -14,7 +14,7 @@
 <header class="topbar">
   <div class="brand">
     <h1>Render Cloud Demo</h1>
-    <p class="sub">Simple cloud metrics & CPU load simulator</p>
+    <p class="sub">Simple cloud metrics, autoscaler simulation & CPU load tester</p>
   </div>
 
   <div class="actions">
@@ -62,22 +62,41 @@
     </div>
 
     <div class="card">
-      <h2>CPU / Memory History</h2>
+      <h2>CPU / Memory History (Autoscaler Aware)</h2>
       <canvas id="chart" height="160"></canvas>
     </div>
+
+    <div class="card autoscaler-card">
+      <h2>Autoscaler Simulation</h2>
+
+      <div class="auto-grid">
+        <div>
+          <strong>Scaler Decision:</strong>
+          <div id="scale_state" class="state-label">-</div>
+        </div>
+
+        <div>
+          <strong>Instances Running:</strong>
+          <div id="instance_count" class="state-label">1</div>
+        </div>
+      </div>
+
+      <p class="hint">
+        Scaler checks CPU every 3 seconds.<br>
+        Scale Up > 70% CPU<br>
+        Scale Down < 30% CPU
+      </p>
+
+      <!-- INSTANCE DIAGRAM -->
+      <div class="instances-wrapper">
+        <h3 class="instances-title">Simulated Cloud Instances</h3>
+        <div id="instances" class="instances-grid" aria-live="polite"></div>
+      </div>
+    </div>
+
   </section>
 
   <aside class="right">
-    <div class="card">
-      <h2>Actions / Demo</h2>
-      <p>Simulate cloud usage spikes using CPU burn.</p>
-      <ol>
-        <li>Set burn milliseconds (e.g., 800 ms)</li>
-        <li>Click Trigger Burn</li>
-        <li>Or click Burst (5x) for concurrency</li>
-      </ol>
-    </div>
-
     <div class="card small">
       <h3>Recent Events</h3>
       <ul id="events" class="events"></ul>
@@ -86,7 +105,7 @@
 </main>
 
 <footer class="footer">
-  <small>Live metrics update every 2 seconds</small>
+  <small>Live metrics update every 2 seconds. Autoscaler acts every 3 seconds.</small>
 </footer>
 
 <script>
@@ -99,52 +118,76 @@
   const rssData = [];
   const heapData = [];
 
+  let instances = 1; // simulated cloud instances
+  const maxInstances = 6;
+  const minInstances = 1;
+
+  // Chart setup
   const chart = new Chart(document.getElementById("chart"), {
     type: "line",
     data: {
       labels,
       datasets: [
-        {
-          label: "CPU %",
-          data: cpuData,
-          borderColor: "#ef4444",
-          borderWidth: 2,
-          tension: 0.3
-        },
-        {
-          label: "RSS (MB)",
-          data: rssData,
-          borderColor: "#60a5fa",
-          borderWidth: 2,
-          tension: 0.3
-        },
-        {
-          label: "Heap Used (MB)",
-          data: heapData,
-          borderColor: "#f472b6",
-          borderWidth: 2,
-          tension: 0.3
-        }
+        { label: "CPU %", borderColor: "#ef4444", borderWidth: 2, data: cpuData, tension: 0.3 },
+        { label: "RSS (MB)", borderColor: "#60a5fa", borderWidth: 2, data: rssData, tension: 0.3 },
+        { label: "Heap (MB)", borderColor: "#f472b6", borderWidth: 2, data: heapData, tension: 0.3 }
       ]
     },
-    options: { animation: false, responsive: true }
+    options: {
+      animation: false,
+      responsive: true,
+      scales: {
+        y: { beginAtZero: true }
+      }
+    }
   });
 
   const eventsEl = document.getElementById("events");
+  const instancesEl = document.getElementById("instances");
 
   function addEvent(msg) {
     const li = document.createElement("li");
     li.innerText = new Date().toLocaleTimeString() + " — " + msg;
     eventsEl.prepend(li);
-    while (eventsEl.children.length > 12) eventsEl.removeChild(eventsEl.lastChild);
+    while (eventsEl.children.length > 15) eventsEl.removeChild(eventsEl.lastChild);
+  }
+
+  function renderInstances(count) {
+    // Smooth update: compare with current DOM count and animate additions/removals
+    const current = instancesEl.children.length;
+    if (count === current) return;
+
+    // If increasing: add with entry animation
+    if (count > current) {
+      for (let i = current + 1; i <= count; i++) {
+        const box = document.createElement("div");
+        box.className = "instance-box entry";
+        box.setAttribute("data-instance", i);
+        box.innerHTML = `<div class="inst-header">Instance ${i}</div><div class="inst-sub">running</div>`;
+        instancesEl.appendChild(box);
+        // trigger reflow then remove 'entry' class for CSS animation to play
+        requestAnimationFrame(() => box.classList.remove("entry"));
+      }
+    } else {
+      // If decreasing: remove with exit animation
+      for (let i = current; i > count; i--) {
+        const node = instancesEl.querySelector('[data-instance="' + i + '"]');
+        if (!node) continue;
+        node.classList.add("exit");
+        // after animation remove
+        node.addEventListener("animationend", () => {
+          if (node && node.parentNode) node.parentNode.removeChild(node);
+        }, { once: true });
+      }
+    }
   }
 
   async function fetchStatus() {
     try {
-      const res = await fetch(statusUrl);
-      const s = await res.json();
+      const r = await fetch(statusUrl);
+      const s = await r.json();
 
-      document.getElementById("uptime").innerText = s.uptime_s + " s";
+      document.getElementById("uptime").innerText = s.uptime_s + "s";
       document.getElementById("cpus").innerText = s.cpus;
 
       const cpuBox = document.getElementById("cpu_val");
@@ -167,19 +210,54 @@
       }
 
       chart.update();
-    } catch {
-      addEvent("Error fetching /status");
+      return s.cpu_percent;
+    } catch (err) {
+      addEvent("Error fetching /status: " + (err.message || err));
+      return null;
     }
   }
 
-  setInterval(fetchStatus, 2000);
+  // Autoscaler interval
+  setInterval(async () => {
+    const cpu = await fetchStatus();
+    if (cpu === null) return;
+
+    const scaleLabel = document.getElementById("scale_state");
+    const instanceLabel = document.getElementById("instance_count");
+
+    if (cpu > 70 && instances < maxInstances) {
+      instances++;
+      scaleLabel.innerText = "Scale Up";
+      scaleLabel.style.color = "#ef4444";
+      addEvent("🚀 Scaled Up → Instances: " + instances);
+      renderInstances(instances);
+    }
+    else if (cpu < 30 && instances > minInstances) {
+      instances--;
+      scaleLabel.innerText = "Scale Down";
+      scaleLabel.style.color = "#4ade80";
+      addEvent("📉 Scaled Down → Instances: " + instances);
+      renderInstances(instances);
+    }
+    else {
+      scaleLabel.innerText = "Stable";
+      scaleLabel.style.color = "#facc15";
+    }
+
+    instanceLabel.innerText = instances;
+  }, 3000);
+
+  // initial render of one instance
+  renderInstances(instances);
+
+  // initial fetch so chart isn't empty
   fetchStatus();
 
+  // BURN ACTIONS
   document.getElementById("burnBtn").onclick = async () => {
     const ms = Number(document.getElementById("burnMs").value);
-    addEvent("Triggering burn " + ms + "ms");
+    addEvent("Burn triggered: " + ms + "ms");
     await fetch("/burn?ms=" + ms);
-    addEvent("Burn finished");
   };
 
   document.getElementById("burstBtn").onclick = () => {
@@ -187,6 +265,7 @@
     addEvent("Burst x5 (" + ms + "ms)");
     for (let i = 0; i < 5; i++) fetch("/burn?ms=" + ms);
   };
+
 })();
 </script>
 
